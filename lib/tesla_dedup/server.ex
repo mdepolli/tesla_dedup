@@ -31,7 +31,7 @@ defmodule TeslaDedup.Server do
   @spec deduplicate(String.t()) ::
           {:ok, :execute} | {:ok, :wait, reference()} | {:ok, any()}
   def deduplicate(request_hash) do
-    GenServer.call(__MODULE__, {:deduplicate, request_hash, self()}, :infinity)
+    GenServer.call(__MODULE__, {:deduplicate, request_hash, self()})
   end
 
   @doc """
