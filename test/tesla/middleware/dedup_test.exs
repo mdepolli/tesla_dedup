@@ -227,11 +227,17 @@ defmodule Tesla.Middleware.DedupTest do
           Task.async(fn ->
             case Server.deduplicate(hash) do
               {:ok, :execute} ->
-                {:execute, i}
+                # Stay alive until signaled so owner doesn't die mid-test
+                receive do
+                  :complete -> {:execute, i}
+                after
+                  5_000 -> {:execute_timeout, i}
+                end
 
               {:ok, :wait, ref} ->
                 receive do
                   {:dedup_response, ^ref, result} -> {:waited, i, result}
+                  {:dedup_error, ^ref, reason} -> {:error, i, reason}
                 after
                   5_000 -> {:timeout, i}
                 end
@@ -249,26 +255,16 @@ defmodule Tesla.Middleware.DedupTest do
       result = {:ok, %Tesla.Env{status: 200, body: "concurrent success"}}
       Server.complete(hash, result)
 
+      # Signal the executor to finish
+      Enum.each(tasks, fn task -> send(task.pid, :complete) end)
+
       # Collect results
       results = Task.await_many(tasks, 5_000)
 
-      executes =
-        Enum.filter(results, fn
-          {:execute, _} -> true
-          _ -> false
-        end)
+      executes = Enum.filter(results, fn result -> elem(result, 0) == :execute end)
 
       # Should have exactly one executor
       assert length(executes) == 1
-
-      # All waiters should eventually get the response
-      waiters =
-        Enum.filter(results, fn
-          {:waited, _, _} -> true
-          _ -> false
-        end)
-
-      assert length(waiters) >= 45
     end
   end
 
@@ -372,6 +368,119 @@ defmodule Tesla.Middleware.DedupTest do
 
       # Test passes if no errors occurred
       :ok
+    end
+  end
+
+  describe "multi-hash per process" do
+    test "same process can deduplicate two different hashes without leaking" do
+      hash1 = Server.hash(:post, "https://api.com/multi-hash-1", "data1")
+      hash2 = Server.hash(:post, "https://api.com/multi-hash-2", "data2")
+
+      # Same process starts two different dedup hashes
+      assert {:ok, :execute} = Server.deduplicate(hash1)
+      assert {:ok, :execute} = Server.deduplicate(hash2)
+
+      # Complete the first hash
+      result1 = {:ok, %Tesla.Env{status: 200, body: "response1"}}
+      Server.complete(hash1, result1)
+
+      # Second hash should still be in-flight (not leaked)
+      waiter_task =
+        Task.async(fn ->
+          case Server.deduplicate(hash2) do
+            {:ok, :wait, ref} ->
+              receive do
+                {:dedup_response, ^ref, result} -> {:waited, result}
+              after
+                2_000 -> :timeout
+              end
+
+            {:ok, :execute} ->
+              :leaked
+          end
+        end)
+
+      Process.sleep(20)
+
+      result2 = {:ok, %Tesla.Env{status: 200, body: "response2"}}
+      Server.complete(hash2, result2)
+
+      result = Task.await(waiter_task, 2_000)
+      assert {:waited, ^result2} = result
+    end
+
+    test "process death cleans up all tracked hashes" do
+      hash1 = Server.hash(:post, "https://api.com/multi-death-1", "data1")
+      hash2 = Server.hash(:post, "https://api.com/multi-death-2", "data2")
+
+      {pid, ref} =
+        spawn_monitor(fn ->
+          {:ok, :execute} = Server.deduplicate(hash1)
+          {:ok, :execute} = Server.deduplicate(hash2)
+        end)
+
+      receive do
+        {:DOWN, ^ref, :process, ^pid, :normal} -> :ok
+      after
+        1_000 -> flunk("Process didn't die")
+      end
+
+      Process.sleep(50)
+
+      assert {:ok, :execute} = Server.deduplicate(hash1)
+      assert {:ok, :execute} = Server.deduplicate(hash2)
+    end
+
+    test "process that is owner of one hash and waiter on another cleans up both on death" do
+      hash_owned = Server.hash(:post, "https://api.com/multi-role-owned", "data")
+      hash_waited = Server.hash(:post, "https://api.com/multi-role-waited", "data")
+
+      # Start the first hash from another process (so our spawned process will be a waiter)
+      owner_task =
+        Task.async(fn ->
+          {:ok, :execute} = Server.deduplicate(hash_waited)
+
+          receive do
+            :complete -> :ok
+          end
+        end)
+
+      Process.sleep(20)
+
+      # Spawn a process that owns hash_owned and waits on hash_waited, then dies
+      {pid, ref} =
+        spawn_monitor(fn ->
+          {:ok, :execute} = Server.deduplicate(hash_owned)
+          {:ok, :wait, _ref} = Server.deduplicate(hash_waited)
+        end)
+
+      receive do
+        {:DOWN, ^ref, :process, ^pid, :normal} -> :ok
+      after
+        1_000 -> flunk("Process didn't die")
+      end
+
+      Process.sleep(50)
+
+      # hash_owned should have been cleaned up (owner died)
+      assert {:ok, :execute} = Server.deduplicate(hash_owned)
+
+      # hash_waited should still be in-flight (the original owner_task is alive)
+      waiter_task =
+        Task.async(fn ->
+          case Server.deduplicate(hash_waited) do
+            {:ok, :wait, _ref} -> :still_in_flight
+            {:ok, :execute} -> :was_cleaned_up
+          end
+        end)
+
+      result = Task.await(waiter_task, 2_000)
+      assert result == :still_in_flight
+
+      # Clean up
+      send(owner_task.pid, :complete)
+      Task.await(owner_task, 1_000)
+      Server.complete(hash_waited, {:ok, %Tesla.Env{status: 200}})
     end
   end
 

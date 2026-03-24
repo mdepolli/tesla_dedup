@@ -64,8 +64,8 @@ defmodule TeslaDedup.Server do
   @impl true
   def init(_opts) do
     # ETS table for tracking requests
-    # Format: {hash, state, data, timestamp}
-    # States: {:in_flight, [waiters]} | {:completed, result}
+    # Format: {hash, state, ref, timestamp}
+    # States: {:in_flight, [waiter_pids], owner_pid} | {:completed, result}
     # heir: :none ensures table dies with process (prevents orphaning on crash)
     # read/write_concurrency improves performance under high concurrent load
     table =
@@ -81,7 +81,10 @@ defmodule TeslaDedup.Server do
     # Schedule periodic cleanup
     schedule_cleanup()
 
-    {:ok, %{table: table}}
+    # pid_to_hashes: reverse index for O(1) lookup on process death
+    #   %{pid => MapSet.t(hash)} — supports multiple concurrent hashes per PID
+    # monitors: %{pid => monitor_ref} for cleanup (one monitor per PID)
+    {:ok, %{table: table, pid_to_hashes: %{}, monitors: %{}}}
   end
 
   @impl true
@@ -89,14 +92,12 @@ defmodule TeslaDedup.Server do
     case :ets.lookup(state.table, hash) do
       [] ->
         ref = make_ref()
-        :ets.insert(state.table, {hash, {:in_flight, []}, ref, timestamp()})
-        {:reply, {:ok, :execute}, state}
+        :ets.insert(state.table, {hash, {:in_flight, [], caller_pid}, ref, timestamp()})
+        {:reply, {:ok, :execute}, monitor_pid(state, caller_pid, hash)}
 
-      [{^hash, {:in_flight, waiters}, ref, _ts}] ->
-        # Monitor the waiter to detect if it dies/times out
-        Process.monitor(caller_pid)
-        :ets.update_element(state.table, hash, {2, {:in_flight, [caller_pid | waiters]}})
-        {:reply, {:ok, :wait, ref}, state}
+      [{^hash, {:in_flight, waiters, owner}, ref, _ts}] ->
+        :ets.update_element(state.table, hash, {2, {:in_flight, [caller_pid | waiters], owner}})
+        {:reply, {:ok, :wait, ref}, monitor_pid(state, caller_pid, hash)}
 
       [{^hash, {:completed, result}, _ref, _ts}] ->
         {:reply, {:ok, result}, state}
@@ -106,7 +107,7 @@ defmodule TeslaDedup.Server do
   @impl true
   def handle_cast({:complete, hash, result}, state) do
     case :ets.lookup(state.table, hash) do
-      [{^hash, {:in_flight, waiters}, ref, _ts}] ->
+      [{^hash, {:in_flight, waiters, owner}, ref, _ts}] ->
         Enum.each(waiters, fn pid ->
           send(pid, {:dedup_response, ref, result})
         end)
@@ -114,11 +115,12 @@ defmodule TeslaDedup.Server do
         # Mark as completed with short TTL for race conditions
         :ets.insert(state.table, {hash, {:completed, result}, ref, timestamp()})
 
-      _ ->
-        :ok
-    end
+        # Clean up monitors for all participants of this hash
+        {:noreply, demonitor_pids(state, [owner | waiters], hash)}
 
-    {:noreply, state}
+      _ ->
+        {:noreply, state}
+    end
   end
 
   @impl true
@@ -128,25 +130,29 @@ defmodule TeslaDedup.Server do
   end
 
   @impl true
-  def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
-    # This prevents memory leaks when waiters timeout or crash
-    :ets.foldl(
-      fn
-        {hash, {:in_flight, waiters}, ref, ts}, acc ->
-          new_waiters = List.delete(waiters, pid)
+  def handle_info({:DOWN, _mon_ref, :process, pid, _reason}, state) do
+    {hashes, pid_to_hashes} = Map.pop(state.pid_to_hashes, pid, MapSet.new())
+    {_mon_ref, monitors} = Map.pop(state.monitors, pid)
+    state = %{state | pid_to_hashes: pid_to_hashes, monitors: monitors}
 
-          if new_waiters != waiters do
-            :ets.insert(state.table, {hash, {:in_flight, new_waiters}, ref, ts})
-          end
+    state =
+      Enum.reduce(hashes, state, fn hash, acc ->
+        case :ets.lookup(acc.table, hash) do
+          [{^hash, {:in_flight, _waiters, ^pid}, _ref, _ts}] ->
+            # Original requester died — clean up entry
+            :ets.delete(acc.table, hash)
+            acc
 
-          acc
+          [{^hash, {:in_flight, waiters, owner}, ref, ts}] ->
+            # A waiter died — remove from waiter list
+            new_waiters = List.delete(waiters, pid)
+            :ets.insert(acc.table, {hash, {:in_flight, new_waiters, owner}, ref, ts})
+            acc
 
-        _other, acc ->
-          acc
-      end,
-      nil,
-      state.table
-    )
+          _ ->
+            acc
+        end
+      end)
 
     {:noreply, state}
   end
@@ -169,7 +175,44 @@ defmodule TeslaDedup.Server do
     {:noreply, state}
   end
 
+  @impl true
+  def handle_info(_msg, state) do
+    {:noreply, state}
+  end
+
   # Private Functions
+
+  defp monitor_pid(state, pid, hash) do
+    hashes = Map.get(state.pid_to_hashes, pid, MapSet.new())
+    state = put_in(state, [:pid_to_hashes, pid], MapSet.put(hashes, hash))
+
+    if Map.has_key?(state.monitors, pid) do
+      state
+    else
+      mon_ref = Process.monitor(pid)
+      put_in(state, [:monitors, pid], mon_ref)
+    end
+  end
+
+  defp demonitor_pids(state, pids, hash) do
+    Enum.reduce(pids, state, fn pid, acc ->
+      case Map.get(acc.pid_to_hashes, pid) do
+        nil ->
+          acc
+
+        hashes ->
+          remaining = MapSet.delete(hashes, hash)
+
+          if Enum.empty?(remaining) do
+            {mon_ref, monitors} = Map.pop(acc.monitors, pid)
+            if mon_ref, do: Process.demonitor(mon_ref, [:flush])
+            %{acc | monitors: monitors, pid_to_hashes: Map.delete(acc.pid_to_hashes, pid)}
+          else
+            put_in(acc, [:pid_to_hashes, pid], remaining)
+          end
+      end
+    end)
+  end
 
   defp schedule_cleanup do
     Process.send_after(self(), :cleanup, 1_000)
