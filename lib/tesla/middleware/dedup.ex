@@ -122,18 +122,22 @@ defmodule Tesla.Middleware.Dedup do
 
       {:ok, :wait, ref} ->
         # Duplicate in-flight - wait for the first request to complete
-        :telemetry.execute(
-          [:tesla_dedup, :wait],
-          %{},
-          %{
-            dedup_key: dedup_key,
-            method: env.method,
-            url: env.url
-          }
-        )
+        wait_start = System.monotonic_time(:millisecond)
 
         receive do
           {:dedup_response, ^ref, result} ->
+            wait_time_ms = System.monotonic_time(:millisecond) - wait_start
+
+            :telemetry.execute(
+              [:tesla_dedup, :wait],
+              %{wait_time_ms: wait_time_ms},
+              %{
+                dedup_key: dedup_key,
+                method: env.method,
+                url: env.url
+              }
+            )
+
             result
 
           {:dedup_error, ^ref, reason} ->
