@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-24
+
 ### Fixed
 
 - Waiters now receive `{:dedup_error, ref, :requester_down}` when the original requester dies, instead of hanging until the 30-second timeout
@@ -64,5 +66,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Safety**: Supervisor-managed GenServer with automatic restart on crash
 - **Memory**: Completed requests automatically cleaned up to prevent leaks
 
-[unreleased]: https://github.com/[USERNAME]/tesla_dedup/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/[USERNAME]/tesla_dedup/releases/tag/v0.1.0
+[unreleased]: https://github.com/mdepolli/tesla_dedup/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mdepolli/tesla_dedup/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/mdepolli/tesla_dedup/releases/tag/v0.1.0
