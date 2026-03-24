@@ -33,7 +33,8 @@ defmodule TeslaDedup.MixProject do
       {:telemetry, "~> 1.0"},
 
       # Dev/Test dependencies
-      {:ex_doc, "~> 0.31", only: :dev, runtime: false},
+      {:ex_doc, "~> 0.40", only: :dev, runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:hackney, "~> 1.18", only: :test}
     ]
   end
