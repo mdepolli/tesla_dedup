@@ -197,7 +197,7 @@ defmodule Tesla.Middleware.DedupTest do
   end
 
   describe "original requester death" do
-    test "waiters receive error when original requester dies" do
+    test "cleans up entry when owner dies with no waiters" do
       hash = Server.hash(:post, "https://api.com/requester-death-test", "data")
 
       {requester_pid, requester_ref} =
@@ -769,7 +769,9 @@ defmodule Tesla.Middleware.DedupTest do
       Task.await_many([task1, task2], 5_000)
 
       assert_received {:telemetry, [:tesla_dedup, :execute], _, _}
-      assert_received {:telemetry, [:tesla_dedup, :wait], _, _}
+      assert_received {:telemetry, [:tesla_dedup, :wait], measurements, _}
+      assert is_integer(measurements.wait_time_ms)
+      assert measurements.wait_time_ms >= 0
     end
 
     test "emits abort event when original requester dies" do

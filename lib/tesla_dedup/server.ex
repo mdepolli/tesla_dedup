@@ -7,7 +7,6 @@ defmodule TeslaDedup.Server do
   """
 
   use GenServer
-  require Logger
 
   @completed_ttl 500
 
@@ -217,23 +216,31 @@ defmodule TeslaDedup.Server do
   end
 
   defp demonitor_pids(state, pids, hash) do
-    Enum.reduce(pids, state, fn pid, acc ->
-      case Map.get(acc.pid_to_hashes, pid) do
-        nil ->
-          acc
+    Enum.reduce(pids, state, fn pid, acc -> cleanup_pid_hash(acc, pid, hash) end)
+  end
 
-        hashes ->
-          remaining = MapSet.delete(hashes, hash)
+  defp cleanup_pid_hash(state, pid, hash) do
+    case Map.get(state.pid_to_hashes, pid) do
+      nil ->
+        state
 
-          if Enum.empty?(remaining) do
-            {mon_ref, monitors} = Map.pop(acc.monitors, pid)
-            if mon_ref, do: Process.demonitor(mon_ref, [:flush])
-            %{acc | monitors: monitors, pid_to_hashes: Map.delete(acc.pid_to_hashes, pid)}
-          else
-            put_in(acc, [:pid_to_hashes, pid], remaining)
-          end
-      end
-    end)
+      hashes ->
+        hashes
+        |> MapSet.delete(hash)
+        |> cleanup_remaining_hashes(pid, state)
+    end
+  end
+
+  defp cleanup_remaining_hashes(remaining, pid, state) do
+    if Enum.empty?(remaining) do
+      # No more active hashes for this PID — fully clean up
+      {mon_ref, monitors} = Map.pop(state.monitors, pid)
+      if mon_ref, do: Process.demonitor(mon_ref, [:flush])
+      %{state | monitors: monitors, pid_to_hashes: Map.delete(state.pid_to_hashes, pid)}
+    else
+      # PID still has other active hashes — keep monitor, update set
+      put_in(state, [:pid_to_hashes, pid], remaining)
+    end
   end
 
   defp schedule_cleanup do

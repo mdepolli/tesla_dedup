@@ -89,8 +89,6 @@ defmodule Tesla.Middleware.Dedup do
 
   @behaviour Tesla.Middleware
 
-  require Logger
-
   @impl Tesla.Middleware
   def call(env, next, opts) do
     dedup_key = generate_key(env, opts)
@@ -109,16 +107,22 @@ defmodule Tesla.Middleware.Dedup do
         )
 
         # Execute request through remaining middleware
-        result =
-          case Tesla.run(env, next) do
-            {:ok, _env} = success -> success
-            {:error, _reason} = error -> error
-          end
+        try do
+          result =
+            case Tesla.run(env, next) do
+              {:ok, _env} = success -> success
+              {:error, _reason} = error -> error
+            end
 
-        # Share result with waiting requests
-        TeslaDedup.Server.complete(dedup_key, result)
+          # Share result with waiting requests
+          TeslaDedup.Server.complete(dedup_key, result)
 
-        result
+          result
+        rescue
+          exception ->
+            TeslaDedup.Server.cancel(dedup_key)
+            reraise exception, __STACKTRACE__
+        end
 
       {:ok, :wait, ref} ->
         # Duplicate in-flight - wait for the first request to complete
