@@ -712,7 +712,8 @@ defmodule Tesla.Middleware.DedupTest do
       events = [
         [:tesla_dedup, :execute],
         [:tesla_dedup, :wait],
-        [:tesla_dedup, :cache_hit]
+        [:tesla_dedup, :cache_hit],
+        [:tesla_dedup, :abort]
       ]
 
       :telemetry.attach_many(
@@ -769,6 +770,46 @@ defmodule Tesla.Middleware.DedupTest do
 
       assert_received {:telemetry, [:tesla_dedup, :execute], _, _}
       assert_received {:telemetry, [:tesla_dedup, :wait], _, _}
+    end
+
+    test "emits abort event when original requester dies" do
+      hash = Server.hash(:post, "https://api.com/telemetry-abort-test", "data")
+
+      {requester_pid, requester_ref} =
+        spawn_monitor(fn ->
+          {:ok, :execute} = Server.deduplicate(hash)
+          Process.sleep(:infinity)
+        end)
+
+      Process.sleep(20)
+
+      waiter_task =
+        Task.async(fn ->
+          {:ok, :wait, ref} = Server.deduplicate(hash)
+
+          receive do
+            {:dedup_error, ^ref, _reason} -> :ok
+          after
+            2_000 -> :timeout
+          end
+        end)
+
+      Process.sleep(20)
+
+      Process.exit(requester_pid, :kill)
+
+      receive do
+        {:DOWN, ^requester_ref, :process, ^requester_pid, :killed} -> :ok
+      after
+        1_000 -> flunk("Requester didn't die")
+      end
+
+      Task.await(waiter_task, 2_000)
+
+      assert_receive {:telemetry, [:tesla_dedup, :abort], measurements, metadata}, 1_000
+      assert measurements.waiter_count == 1
+      assert metadata.dedup_key == hash
+      assert metadata.reason == :requester_down
     end
   end
 end

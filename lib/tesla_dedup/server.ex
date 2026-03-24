@@ -194,6 +194,12 @@ defmodule TeslaDedup.Server do
       send(pid, {:dedup_error, ref, reason})
     end)
 
+    :telemetry.execute(
+      [:tesla_dedup, :abort],
+      %{waiter_count: length(waiters)},
+      %{dedup_key: hash, reason: reason}
+    )
+
     :ets.delete(state.table, hash)
     demonitor_pids(state, [owner | waiters], hash)
   end

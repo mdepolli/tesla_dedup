@@ -62,6 +62,7 @@ defmodule Tesla.Middleware.Dedup do
   - `[:tesla_dedup, :execute]` - First request, will execute
   - `[:tesla_dedup, :wait]` - Duplicate request, waiting for response
   - `[:tesla_dedup, :cache_hit]` - Request completed recently, returning cached result
+  - `[:tesla_dedup, :abort]` - Request aborted (owner died or cancelled), includes `:waiter_count` and `:reason`
 
   ### Event Metadata
 
