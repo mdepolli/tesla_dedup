@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Waiters now receive `{:dedup_error, ref, :requester_down}` when the original requester dies, instead of hanging until the 30-second timeout
+- Waiters now receive `{:dedup_error, ref, :request_cancelled}` when a request is cancelled via `Server.cancel/1`, instead of hanging
+- Middleware exceptions in downstream middleware now cancel the dedup entry via `try/rescue`, preventing waiters from hanging
+- Process death lookup is now O(1) via `pid_to_hashes` reverse index (was O(n) ETS scan)
+- Processes tracking multiple concurrent dedup hashes no longer overwrite each other's tracking state (uses MapSet per PID)
+- Monitors are now properly cleaned up with `Process.demonitor/2` on request completion
+
+### Added
+
+- New telemetry event `[:tesla_dedup, :abort]` emitted when a request is aborted, with `waiter_count` and `reason` measurements/metadata
+- `wait_time_ms` measurement in `[:tesla_dedup, :wait]` telemetry event reporting actual wait duration
+
+### Changed
+
+- `Server.deduplicate/1` now uses the default 5-second GenServer timeout instead of `:infinity`, surfacing stuck GenServer issues instead of hanging indefinitely
+- In-flight ETS entries now track the owner PID: `{:in_flight, [waiters], owner_pid}`
+
+### Dependencies
+
+- Added `credo ~> 1.7` for static analysis
+- Updated `ex_doc` from `~> 0.31` to `~> 0.40`
+
 ## [0.1.0] - 2025-10-13
 
 ### Added
