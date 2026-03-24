@@ -125,8 +125,14 @@ defmodule TeslaDedup.Server do
 
   @impl true
   def handle_cast({:cancel, hash}, state) do
-    :ets.delete(state.table, hash)
-    {:noreply, state}
+    case :ets.lookup(state.table, hash) do
+      [{^hash, {:in_flight, _waiters, _owner}, _ref, _ts}] ->
+        {:noreply, abort_in_flight(state, hash, :request_cancelled)}
+
+      _ ->
+        :ets.delete(state.table, hash)
+        {:noreply, state}
+    end
   end
 
   @impl true
@@ -139,9 +145,8 @@ defmodule TeslaDedup.Server do
       Enum.reduce(hashes, state, fn hash, acc ->
         case :ets.lookup(acc.table, hash) do
           [{^hash, {:in_flight, _waiters, ^pid}, _ref, _ts}] ->
-            # Original requester died — clean up entry
-            :ets.delete(acc.table, hash)
-            acc
+            # Original requester died — notify all waiters and clean up
+            abort_in_flight(acc, hash, :requester_down)
 
           [{^hash, {:in_flight, waiters, owner}, ref, ts}] ->
             # A waiter died — remove from waiter list
@@ -181,6 +186,17 @@ defmodule TeslaDedup.Server do
   end
 
   # Private Functions
+
+  defp abort_in_flight(state, hash, reason) do
+    [{^hash, {:in_flight, waiters, owner}, ref, _ts}] = :ets.lookup(state.table, hash)
+
+    Enum.each(waiters, fn pid ->
+      send(pid, {:dedup_error, ref, reason})
+    end)
+
+    :ets.delete(state.table, hash)
+    demonitor_pids(state, [owner | waiters], hash)
+  end
 
   defp monitor_pid(state, pid, hash) do
     hashes = Map.get(state.pid_to_hashes, pid, MapSet.new())

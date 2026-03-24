@@ -196,6 +196,137 @@ defmodule Tesla.Middleware.DedupTest do
     end
   end
 
+  describe "original requester death" do
+    test "waiters receive error when original requester dies" do
+      hash = Server.hash(:post, "https://api.com/requester-death-test", "data")
+
+      {requester_pid, requester_ref} =
+        spawn_monitor(fn ->
+          {:ok, :execute} = Server.deduplicate(hash)
+        end)
+
+      receive do
+        {:DOWN, ^requester_ref, :process, ^requester_pid, :normal} -> :ok
+      after
+        1_000 -> flunk("Requester didn't die")
+      end
+
+      Process.sleep(50)
+
+      # Entry should have been cleaned up
+      assert {:ok, :execute} = Server.deduplicate(hash)
+    end
+
+    test "waiters are notified when original requester crashes" do
+      hash = Server.hash(:post, "https://api.com/requester-crash-notify-test", "data")
+
+      {requester_pid, requester_ref} =
+        spawn_monitor(fn ->
+          {:ok, :execute} = Server.deduplicate(hash)
+          Process.sleep(:infinity)
+        end)
+
+      Process.sleep(20)
+
+      waiter_task =
+        Task.async(fn ->
+          {:ok, :wait, ref} = Server.deduplicate(hash)
+
+          receive do
+            {:dedup_response, ^ref, response} -> {:got_response, response}
+            {:dedup_error, ^ref, reason} -> {:got_error, reason}
+          after
+            2_000 -> :timeout
+          end
+        end)
+
+      Process.sleep(20)
+
+      Process.exit(requester_pid, :kill)
+
+      receive do
+        {:DOWN, ^requester_ref, :process, ^requester_pid, :killed} -> :ok
+      after
+        1_000 -> flunk("Requester didn't die")
+      end
+
+      result = Task.await(waiter_task, 2_000)
+      assert {:got_error, :requester_down} = result
+    end
+
+    test "complete and owner death race does not crash GenServer" do
+      hash = Server.hash(:post, "https://api.com/race-complete-death", "data")
+
+      {requester_pid, requester_ref} =
+        spawn_monitor(fn ->
+          {:ok, :execute} = Server.deduplicate(hash)
+          Process.sleep(:infinity)
+        end)
+
+      Process.sleep(20)
+
+      waiter_task =
+        Task.async(fn ->
+          {:ok, :wait, ref} = Server.deduplicate(hash)
+
+          receive do
+            {:dedup_response, ^ref, response} -> {:got_response, response}
+            {:dedup_error, ^ref, reason} -> {:got_error, reason}
+          after
+            2_000 -> :timeout
+          end
+        end)
+
+      Process.sleep(20)
+
+      # Fire complete and kill nearly simultaneously
+      response = {:ok, %Tesla.Env{status: 200, body: "race"}}
+      Server.complete(hash, response)
+      Process.exit(requester_pid, :kill)
+
+      receive do
+        {:DOWN, ^requester_ref, :process, ^requester_pid, :killed} -> :ok
+      after
+        1_000 -> flunk("Requester didn't die")
+      end
+
+      # Waiter should get either the response or an error, never hang
+      result = Task.await(waiter_task, 2_000)
+      assert result in [{:got_response, response}, {:got_error, :requester_down}]
+
+      # GenServer should still be alive
+      Process.sleep(50)
+      assert Process.alive?(Process.whereis(TeslaDedup.Server))
+    end
+  end
+
+  describe "Server.cancel/1 - notifies waiters" do
+    test "notifies waiters when request is cancelled" do
+      hash = Server.hash(:post, "https://api.com/cancel-notify-test", "data")
+
+      assert {:ok, :execute} = Server.deduplicate(hash)
+
+      waiter_task =
+        Task.async(fn ->
+          {:ok, :wait, ref} = Server.deduplicate(hash)
+
+          receive do
+            {:dedup_response, ^ref, response} -> {:got_response, response}
+            {:dedup_error, ^ref, reason} -> {:got_error, reason}
+          after
+            2_000 -> :timeout
+          end
+        end)
+
+      Process.sleep(20)
+
+      Server.cancel(hash)
+
+      result = Task.await(waiter_task, 2_000)
+      assert {:got_error, :request_cancelled} = result
+    end
+  end
+
   describe "cleanup" do
     test "removes completed requests after TTL" do
       hash = Server.hash(:post, "https://api.com/test9", "data")
