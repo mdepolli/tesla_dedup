@@ -134,6 +134,9 @@ defmodule Tesla.Middleware.Dedup do
         receive do
           {:dedup_response, ^ref, result} ->
             result
+
+          {:dedup_error, ^ref, reason} ->
+            {:error, reason}
         after
           30_000 ->
             {:error, :dedup_timeout}
